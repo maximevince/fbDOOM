@@ -29,6 +29,7 @@
 #include "d_main.h"
 #include "deh_main.h"
 
+#include "i_input_tty.h"
 #include "i_swap.h"
 #include "i_system.h"
 #include "i_timer.h"
@@ -1140,6 +1141,7 @@ void M_QuitResponse(int key)
 	    S_StartSound(NULL,quitsounds[(gametic>>2)&7]);
 	I_WaitVBL(105);
     }
+    kbd_shutdown();
     I_Quit ();
 }
 
