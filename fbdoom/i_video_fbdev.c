@@ -36,6 +36,7 @@ rcsid[] = "$Id: i_x.c,v 1.6 1997/02/03 22:45:10 b1 Exp $";
 #include "tables.h"
 #include "doomkeys.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -51,7 +52,14 @@ rcsid[] = "$Id: i_x.c,v 1.6 1997/02/03 22:45:10 b1 Exp $";
 //#define CMAP256
 
 struct fb_var_screeninfo fb = {};
-int fb_scaling = 1;
+float fb_scaling = 1;
+int integer_scale = 0;
+// DOOM's 320x200 is scaled to (fb_scale_dst_w x fb_scale_dst_h) via nearest-neighbor blit.
+static int fb_scale_dst_w = 0;
+static int fb_scale_dst_h = 0;
+// Scratch buffer for the scaled index image (palette indices, before color conversion)
+static uint8_t *fb_scaled_buf = NULL;
+
 int usemouse = 0;
 
 struct color {
@@ -125,7 +133,7 @@ void cmap_to_rgb565(uint16_t * out, uint8_t * in, int in_pixels)
         *out = (r | g | b);
 
         in++;
-        for (j = 0; j < fb_scaling; j++) {
+        for (j = 0; j < (int) fb_scaling; j++) {
             out++;
         }
     }
@@ -148,13 +156,30 @@ void cmap_to_fb(uint8_t * out, uint8_t * in, int in_pixels)
         pix |= g << fb.green.offset;
         pix |= b << fb.blue.offset;
 
-        for (k = 0; k < fb_scaling; k++) {
+        for (k = 0; k < (int) fb_scaling; k++) {
             for (j = 0; j < fb.bits_per_pixel/8; j++) {
                 *out = (pix >> (j*8));
                 out++;
             }
         }
         in++;
+    }
+}
+
+// Nearest-neighbor downscale: src (src_w x src_h) palette-index buffer
+// -> dst (dst_w x dst_h) palette-index buffer.
+// Used only when fractional scale is active.
+static void blit_scaled_index(uint8_t *dst, int dst_w, int dst_h,
+                              uint8_t *src, int src_w, int src_h)
+{
+    int x, y;
+    for (y = 0; y < dst_h; y++) {
+        int src_y = y * src_h / dst_h;
+        uint8_t *src_row = src + src_y * src_w;
+        uint8_t *dst_row = dst + y   * dst_w;
+        for (x = 0; x < dst_w; x++) {
+            dst_row[x] = src_row[x * src_w / dst_w];
+        }
     }
 }
 
@@ -180,21 +205,47 @@ void I_InitGraphics (void)
     printf("I_InitGraphics: framebuffer: RGBA: %d%d%d%d, red_off: %d, green_off: %d, blue_off: %d, transp_off: %d\n",
             fb.red.length, fb.green.length, fb.blue.length, fb.transp.length, fb.red.offset, fb.green.offset, fb.blue.offset, fb.transp.offset);
 
-    printf("I_InitGraphics: DOOM screen size: w x h: %d x %d\n", SCREENWIDTH, SCREENHEIGHT);
-
-
     i = M_CheckParmWithArgs("-scaling", 1);
     if (i > 0) {
-        i = atoi(myargv[i + 1]);
-        fb_scaling = i;
-        printf("I_InitGraphics: Scaling factor: %d\n", fb_scaling);
+        // Manually scaling
+        fb_scaling = atof(myargv[i + 1]);
+        fb_scale_dst_w = fb_scaling * SCREENWIDTH;
+        fb_scale_dst_h = fb_scaling * SCREENHEIGHT;
+        if (fb_scale_dst_w > (int)fb.xres || fb_scale_dst_h > (int)fb.yres) {
+            printf("I_InitGraphics: error: requested scaling %.2f results in %dx%d, which exceeds framebuffer size %dx%d\n",
+                    fb_scaling, fb_scale_dst_w, fb_scale_dst_h, fb.xres, fb.yres);
+            exit(-1);
+        }
     } else {
-        fb_scaling = fb.xres / SCREENWIDTH;
-        if (fb.yres / SCREENHEIGHT < fb_scaling)
-            fb_scaling = fb.yres / SCREENHEIGHT;
-        printf("I_InitGraphics: Auto-scaling factor: %d\n", fb_scaling);
+        // Auto scaling
+        // Use fractional scaling: render at 320x200 internally, blit-scale
+        // to the largest rectangle that fits the framebuffer while
+        // keeping DOOM's 16:10 (320:200) aspect ratio.
+
+        // Fit 320:200 into fb.xres x fb.yres (letterbox / pillarbox)
+        fb_scale_dst_w = fb.xres;
+        fb_scale_dst_h = fb.xres * SCREENHEIGHT / SCREENWIDTH;  // scale by width first
+        fb_scaling = (double)fb_scale_dst_w / SCREENWIDTH;
+        if (fb_scale_dst_h > (int)fb.yres) {
+            // Doesn't fit vertically — scale by height instead
+            fb_scale_dst_h = fb.yres;
+            fb_scale_dst_w = fb.yres * SCREENWIDTH / SCREENHEIGHT;
+            fb_scaling = (double)fb_scale_dst_h / SCREENHEIGHT;
+        }
     }
 
+    fb_scaled_buf = (uint8_t *)malloc(fb_scale_dst_w * fb_scale_dst_h);
+    if (!fb_scaled_buf) {
+        printf("I_InitGraphics: failed to allocate fractional-scale buffer\n");
+        exit(-1);
+    }
+
+    if (fb_scaling == floorf(fb_scaling)) {
+        integer_scale = (int)fb_scaling;
+    }
+
+
+    printf("I_InitGraphics: Scaling (%.2f): DOOM 320x200 -> %dx%d (centered in %dx%d)\n", fb_scaling, fb_scale_dst_w, fb_scale_dst_h, fb.xres, fb.yres);
 
     /* Allocate screen to draw to */
 	I_VideoBuffer = (byte*)Z_Malloc (SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);  // For DOOM to draw on
@@ -210,6 +261,10 @@ void I_ShutdownGraphics (void)
 {
 	Z_Free (I_VideoBuffer);
 	free(I_VideoBuffer_FB);
+    if (fb_scaled_buf) {
+        free(fb_scaled_buf);
+        fb_scaled_buf = NULL;
+    }
 }
 
 void I_StartFrame (void)
@@ -406,44 +461,90 @@ void I_FinishUpdate (void)
     int x_offset, y_offset, x_offset_end;
     unsigned char *line_in, *line_out;
 
-    /* Offsets in case FB is bigger than DOOM */
-    /* 600 = fb heigt, 200 screenheight */
-    /* 600 = fb heigt, 200 screenheight */
-    /* 2048 =fb width, 320 screenwidth */
-    y_offset     = (((fb.yres - (SCREENHEIGHT * fb_scaling)) * fb.bits_per_pixel/8)) / 2;
-    x_offset     = (((fb.xres - (SCREENWIDTH  * fb_scaling)) * fb.bits_per_pixel/8)) / 2; // XXX: siglent FB hack: /4 instead of /2, since it seems to handle the resolution in a funny way
-    //x_offset     = 0;
-    x_offset_end = ((fb.xres - (SCREENWIDTH  * fb_scaling)) * fb.bits_per_pixel/8) - x_offset;
+    if (integer_scale == 0) {
+        // ---------------------------------------------------------------
+        // Fractional scaling
+        // 1. Nearest-neighbor blit: I_VideoBuffer (320x200) -> fb_scaled_buf (dst_w x dst_h)
+        // 2. Color-convert each line into I_VideoBuffer_FB, centered in the fb
+        // ---------------------------------------------------------------
+        blit_scaled_index(fb_scaled_buf, fb_scale_dst_w, fb_scale_dst_h,
+                          I_VideoBuffer,  SCREENWIDTH,    SCREENHEIGHT);
 
-    /* DRAW SCREEN */
-    line_in  = (unsigned char *) I_VideoBuffer;
-    line_out = (unsigned char *) I_VideoBuffer_FB;
+        // Center the scaled image in the framebuffer
+        int x_pad = (fb.xres - fb_scale_dst_w) / 2;  // pixels (not bytes)
+        int y_pad = (fb.yres - fb_scale_dst_h) / 2;  // lines
 
-    y = SCREENHEIGHT;
+        // Black out the entire fb buffer (letterbox / pillarbox bars)
+        memset(I_VideoBuffer_FB, 0, fb.xres * fb.yres * (fb.bits_per_pixel / 8));
 
-    while (y--)
-    {
-        int i;
-        for (i = 0; i < fb_scaling; i++) {
-            line_out += x_offset;
-#ifdef CMAP256
-            for (fb_scaling == 1) {
-                memcpy(line_out, line_in, SCREENWIDTH); /* fb_width is bigger than Doom SCREENWIDTH... */
-            } else {
-                //XXX FIXME fb_scaling support!
+        int bpp = fb.bits_per_pixel / 8;
+        for (y = 0; y < fb_scale_dst_h; y++) {
+            uint8_t *src = fb_scaled_buf + y * fb_scale_dst_w;
+            uint8_t *dst = I_VideoBuffer_FB + ((y_pad + y) * fb.xres + x_pad) * bpp;
+            // cmap_to_fb with fb_scaling==0 would skip the scaling loop (k<0 never runs).
+            // Call a local variant: temporarily use fb_scaling=1 around the call.
+            // Simpler: replicate the pixel conversion inline for one pixel at a time.
+            int x;
+            for (x = 0; x < fb_scale_dst_w; x++) {
+                struct color c = colors[src[x]];
+                uint16_t r = (uint16_t)(c.r >> (8 - fb.red.length));
+                uint16_t g = (uint16_t)(c.g >> (8 - fb.green.length));
+                uint16_t b = (uint16_t)(c.b >> (8 - fb.blue.length));
+                uint32_t pix = (r << fb.red.offset) | (g << fb.green.offset) | (b << fb.blue.offset);
+                int j;
+                for (j = 0; j < bpp; j++) {
+                    dst[x * bpp + j] = (pix >> (j * 8)) & 0xFF;
+                }
             }
-#else
-            //cmap_to_rgb565((void*)line_out, (void*)line_in, SCREENWIDTH);
-            cmap_to_fb((void*)line_out, (void*)line_in, SCREENWIDTH);
-#endif
-            line_out += (SCREENWIDTH * fb_scaling * (fb.bits_per_pixel/8)) + x_offset_end;
         }
-        line_in += SCREENWIDTH;
-    }
 
-    /* Start drawing from y-offset */
-    lseek(fd_fb, y_offset * fb.xres, SEEK_SET);
-    write(fd_fb, I_VideoBuffer_FB, (SCREENHEIGHT * fb_scaling * (fb.bits_per_pixel/8)) * fb.xres); /* draw only portion used by doom + x-offsets */
+        lseek(fd_fb, 0, SEEK_SET);
+        write(fd_fb, I_VideoBuffer_FB, fb.xres * fb.yres * (fb.bits_per_pixel / 8));
+
+    } else {
+        // ---------------------------------------------------------------
+        // Integer scaling
+        // ---------------------------------------------------------------
+
+        /* Offsets in case FB is bigger than DOOM */
+        /* 600 = fb heigt, 200 screenheight */
+        /* 600 = fb heigt, 200 screenheight */
+        /* 2048 =fb width, 320 screenwidth */
+        y_offset     = (((fb.yres - (SCREENHEIGHT * integer_scale)) * fb.bits_per_pixel/8)) / 2;
+        x_offset     = (((fb.xres - (SCREENWIDTH  * integer_scale)) * fb.bits_per_pixel/8)) / 2; // XXX: siglent FB hack: /4 instead of /2, since it seems to handle the resolution in a funny way
+        //x_offset     = 0;
+        x_offset_end = ((fb.xres - (SCREENWIDTH  * integer_scale)) * fb.bits_per_pixel/8) - x_offset;
+
+        /* DRAW SCREEN */
+        line_in  = (unsigned char *) I_VideoBuffer;
+        line_out = (unsigned char *) I_VideoBuffer_FB;
+
+        y = SCREENHEIGHT;
+
+        while (y--)
+        {
+            int i;
+            for (i = 0; i < integer_scale; i++) {
+                line_out += x_offset;
+    #ifdef CMAP256
+                for (integer_scale == 1) {
+                    memcpy(line_out, line_in, SCREENWIDTH); /* fb_width is bigger than Doom SCREENWIDTH... */
+                } else {
+                    //XXX FIXME integer_scale support!
+                }
+    #else
+                //cmap_to_rgb565((void*)line_out, (void*)line_in, SCREENWIDTH);
+                cmap_to_fb((void*)line_out, (void*)line_in, SCREENWIDTH);
+    #endif
+                line_out += (SCREENWIDTH * integer_scale * (fb.bits_per_pixel/8)) + x_offset_end;
+            }
+            line_in += SCREENWIDTH;
+        }
+
+        /* Start drawing from y-offset */
+        lseek(fd_fb, y_offset * fb.xres, SEEK_SET);
+        write(fd_fb, I_VideoBuffer_FB, (SCREENHEIGHT * integer_scale * (fb.bits_per_pixel/8)) * fb.xres); /* draw only portion used by doom + x-offsets */
+    }
 }
 
 //
