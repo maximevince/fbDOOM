@@ -17,8 +17,11 @@
 //
 
 #include "config.h"
+#include "i_input_tty.h"
 
 #include <stdio.h>
+#include <signal.h>
+
 
 #include "doomtype.h"
 #include "i_system.h"
@@ -35,6 +38,7 @@ void D_DoomMain (void);
 int main(int argc, char **argv)
 {
     // save arguments
+    signal(SIGINT, handle_sigint);
 
     myargc = argc;
     myargv = argv;

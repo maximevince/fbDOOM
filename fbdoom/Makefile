@@ -63,3 +63,5 @@ $(OBJDIR)/%.o:	%.c
 print:
 	@echo OBJS: $(OBJS)
 
+install:
+	scp $(OUTPUT) root@192.168.1.105:/root

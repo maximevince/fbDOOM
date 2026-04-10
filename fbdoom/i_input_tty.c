@@ -274,6 +274,12 @@ void kbd_shutdown(void)
     exit(0);
 }
 
+void handle_sigint(int sig) {
+    printf("Caught SIGINT, exiting...\n");
+    I_Quit();
+    kbd_shutdown();
+}
+
 static int kbd_init(void)
 {
     struct termios new_term;
